@@ -1,6 +1,6 @@
 # jabearri v0.10.2 — Adversarial Security Assessment
 
-**Build:** v0.10.2 — 887 total tests passing (732 + 81 + 74 across three harnesses)
+**Build:** v0.10.2 — 911 total tests passing (756 + 81 + 74 across three harnesses)
 **Assessment:** Twelve adversarial rounds (v0.9.2) plus Exposure Summary verification (v0.10.1) plus encoded scope traversal hardening, authorization-gate TTY fail-closed fix, and public-IP classification fixes (v0.10.2). 85+ attack vectors. 13 harnesses. Zero open findings.
 
 ---
@@ -24,7 +24,7 @@ Hash comparison with sortKeys normalization, big-integer precision preservation,
 Bearer tokens, cookies (13+ framework defaults, JABEARRI_COOKIE_NAME override, array-header iteration, empty-bearer fallthrough), non-Bearer Authorization schemes (Basic, Digest, Token, ApiKey — recorded as other-auth with scheme reconstruction), X-API-Key (JABEARRI_API_KEY_HEADER configurable), and scheme-less Authorization headers. All verified end-to-end through proxy→record→replay→finding.
 
 ### Scope matching
-Case-insensitive, two-pass percent-decoded, traversal-resolved, matrix-parameter-stripped, trailing-slash-boundary-guarded. Eight bypass vectors tested; all blocked. SSRF blocked by design.
+Case-insensitive, decode-until-stable with encoded-dot folding, traversal-resolved, matrix-parameter-stripped, trailing-slash-boundary-guarded. Eight bypass vectors tested; all blocked. SSRF blocked by design.
 
 ### Operational trust
 Token-B canary (with original User-Agent), minObserved proxy-bypass floor, CI consent auto-skip, User-Agent preservation in replay and anonymous reclassifier.
@@ -81,7 +81,7 @@ Proxy survived randomized stress testing (40 fuzz requests: random paths, 10KB U
 | 5 | Trailing-slash exclude gap | Boundary guard in matches() |
 | 6 | Hash-family mismatch (json: vs raw:) | rawHash cross-family fallback in assessFinding |
 | 8 | Matrix parameter exclude bypass (3 vectors) | Matrix-param stripping in normalizePath |
-| 8 | Double-encoding exclude bypass (2 vectors) | Two-pass decode loop |
+| 8 | Double-encoding exclude bypass (2 vectors) | Decode-until-stable + encoded-dot folding |
 | 8 | Array Authorization header drops valid token | .find() iteration to first non-empty |
 | 9 | Reclassifier cross-family gap | rawHash fallback in reclassifier |
 | 10 | User-Agent mismatch (replay vs recording) | Store and replay original UA |
