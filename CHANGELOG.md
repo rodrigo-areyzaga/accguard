@@ -119,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old-name traces in `.gitignore`, `.npmignore`, and `docs/architecture.svg`
   updated. `docs/accguard-demo.gif` renamed to `docs/jabearri-demo.gif`.
 
-- **887 total tests** (732 in `test/run.js` + 81 in `test/adversarial-harness.js`
+- **911 total tests** (756 in `test/run.js` + 81 in `test/adversarial-harness.js`
   + 74 in `test/deep-adversarial-harness.js`).
 
 ## [0.10.1] — 2026-06-13
