@@ -1979,7 +1979,7 @@ async function runIntegration() {
   assert(orderEntry.contentHash.startsWith('json:'),       'content hash is semantic');
 
   // Replay detects IDOR
-  const { runReplay } = require(root + '/src/replay');
+  const { runReplay, contentHash } = require(root + '/src/replay');
   const findings = await runReplay({
     store:       iStore,
     targetUrl:   'http://127.0.0.1:3099',
@@ -2239,6 +2239,218 @@ async function runIntegration() {
   assert(rawFinding.evidence.matchedHash === rawFinding.evidence.replayRawHash,
     'raw-fallback finding matchedHash is the replay raw hash');
 
+  // ── Distinct-credential guard ─────────────────────────────────────────────
+  section('integration — distinct-credential guard');
+
+  // Regression test: TOKEN_B identical to a recorded source (User A) token
+  // must abort the run rather than replay A-as-A and report a confirmed
+  // finding on a correctly protected endpoint.
+  {
+    let threw = null;
+    try {
+      await runReplay({
+        store:       iStore,
+        targetUrl:   'http://127.0.0.1:3099',
+        secondToken: 'tok-a', // same raw value recorded as the source token above
+        logger:      { log: () => {} },
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert(!!threw, 'self-replay (TOKEN_B === recorded source token) throws');
+    assert(threw && threw.code === 'JABEARRI_SELF_REPLAY',
+      'self-replay error has code JABEARRI_SELF_REPLAY');
+  }
+
+  // Regression test: a scheme-prefixed ('other-auth') source credential, e.g.
+  // "Authorization: Basic abc123", must also be caught when TOKEN_B is
+  // supplied in its documented bare form ("abc123"). The recorded fingerprint
+  // covers the FULL header ("Basic abc123"); the guard must reconstruct the
+  // same effective value at replay time rather than fingerprinting the bare
+  // TOKEN_B string, or this exact self-replay would slip through silently.
+  {
+    const basicResponseBody = JSON.stringify({ id: 5001, item: 'Monitor' });
+    const basicHash = contentHash(Buffer.from(basicResponseBody), 'application/json');
+    const basicServer = http.createServer((req, res) => {
+      if (req.method === 'HEAD' && req.url === '/') { res.writeHead(200); res.end(); return; }
+      if (req.headers['authorization'] === 'Basic abc123' && req.url === '/api/orders/5001') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(basicResponseBody);
+        return;
+      }
+      res.writeHead(403); res.end('{}');
+    });
+    await new Promise(resolve => basicServer.listen(0, '127.0.0.1', resolve));
+    const basicPort = basicServer.address().port;
+
+    const basicStore = new SessionStore();
+    basicStore.record({
+      method: 'GET', url: '/api/orders/5001',
+      headers: { authorization: 'Basic abc123' },
+      statusCode: 200, contentLength: basicResponseBody.length, contentHash: basicHash,
+    });
+
+    // Same effective credential ("Basic abc123") supplied as bare TOKEN_B — must abort.
+    let threw = null;
+    try {
+      await runReplay({
+        store: basicStore, targetUrl: `http://127.0.0.1:${basicPort}`,
+        secondToken: 'abc123', logger: { log: () => {} },
+      });
+    } catch (err) { threw = err; }
+    assert(!!threw, 'self-replay via other-auth scheme reconstruction (Basic) throws');
+    assert(threw && threw.code === 'JABEARRI_SELF_REPLAY',
+      'other-auth self-replay error has code JABEARRI_SELF_REPLAY');
+
+    // A genuinely distinct other-auth credential must NOT be blocked.
+    let findings = null, wrongThrow = null;
+    try {
+      findings = await runReplay({
+        store: basicStore, targetUrl: `http://127.0.0.1:${basicPort}`,
+        secondToken: 'xyz789', logger: { log: () => {} },
+      });
+    } catch (err) { wrongThrow = err; }
+    assert(!wrongThrow, 'distinct other-auth credential (Basic) is not falsely blocked');
+    assert(Array.isArray(findings) && findings.length === 0,
+      'distinct other-auth credential (Basic) correctly produces no finding (403 on replay)');
+
+    // Regression: a genuinely DIFFERENT scheme with the same payload text
+    // ("Token abc123" against a source recorded as "Basic abc123") must NOT
+    // be treated as self-replay. authHeaders() sends a full "scheme value"
+    // TOKEN_B verbatim rather than substituting the recorded scheme, so the
+    // guard's comparison must do the same — reconstructing with the recorded
+    // scheme here would falsely reject a legitimate distinct credential.
+    let diffSchemeThrow = null, diffSchemeFindings = null;
+    try {
+      diffSchemeFindings = await runReplay({
+        store: basicStore, targetUrl: `http://127.0.0.1:${basicPort}`,
+        secondToken: 'Token abc123', logger: { log: () => {} },
+      });
+    } catch (err) { diffSchemeThrow = err; }
+    assert(!diffSchemeThrow,
+      'a different full scheme with the same payload text is not falsely blocked as self-replay');
+    assert(Array.isArray(diffSchemeFindings) && diffSchemeFindings.length === 0,
+      'different-scheme credential correctly produces no finding (403 on replay, since the target only accepts Basic abc123)');
+
+    // Scheme-case bypass: TOKEN_B supplied with a differently-cased scheme
+    // ("basic" vs recorded "Basic") is the same credential per RFC 7235 and
+    // must still abort — the comparison must reconstruct using the RECORDED
+    // scheme's case, not whatever case the operator happened to type.
+    let caseThrew = null;
+    try {
+      await runReplay({
+        store: basicStore, targetUrl: `http://127.0.0.1:${basicPort}`,
+        secondToken: 'basic abc123', logger: { log: () => {} },
+      });
+    } catch (err) { caseThrew = err; }
+    assert(!!caseThrew, 'self-replay with differently-cased scheme (basic vs Basic) throws');
+    assert(caseThrew && caseThrew.code === 'JABEARRI_SELF_REPLAY',
+      'scheme-case self-replay error has code JABEARRI_SELF_REPLAY');
+
+    // Trailing-whitespace bypass, full-form other-auth TOKEN_B.
+    let wsThrew = null;
+    try {
+      await runReplay({
+        store: basicStore, targetUrl: `http://127.0.0.1:${basicPort}`,
+        secondToken: 'Basic abc123 ', logger: { log: () => {} },
+      });
+    } catch (err) { wsThrew = err; }
+    assert(!!wsThrew, 'self-replay with trailing whitespace (other-auth) throws');
+    assert(wsThrew && wsThrew.code === 'JABEARRI_SELF_REPLAY',
+      'trailing-whitespace other-auth self-replay error has code JABEARRI_SELF_REPLAY');
+
+    await new Promise(resolve => basicServer.close(resolve));
+  }
+
+  // Regression test: trailing-whitespace bypass on a bare bearer token —
+  // "tok-a " must be treated the same as "tok-a" for self-replay detection.
+  {
+    let threw = null;
+    try {
+      await runReplay({
+        store:       iStore,
+        targetUrl:   'http://127.0.0.1:3099',
+        secondToken: 'tok-a ', // trailing space, same effective bearer credential
+        logger:      { log: () => {} },
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert(!!threw, 'self-replay with trailing whitespace (bearer) throws');
+    assert(threw && threw.code === 'JABEARRI_SELF_REPLAY',
+      'trailing-whitespace bearer self-replay error has code JABEARRI_SELF_REPLAY');
+  }
+
+  // Regression test: an invalid/expired TOKEN_B (canary gets 401/403) must
+  // abort the run rather than silently proceed to a "0 findings" clean run.
+  {
+    const rejectingServer = http.createServer((req, res) => {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{}');
+
+    });
+    await new Promise(resolve => rejectingServer.listen(0, '127.0.0.1', resolve));
+    const rejectingPort = rejectingServer.address().port;
+
+    const freshStore = new SessionStore();
+    freshStore.record({
+      method: 'GET', url: '/api/orders/1001',
+      headers: { authorization: 'Bearer tok-a' },
+      statusCode: 200, contentLength: 10, contentHash: 'json:deadbeef',
+    });
+
+    let threw = null;
+    try {
+      await runReplay({
+        store:       freshStore,
+        targetUrl:   `http://127.0.0.1:${rejectingPort}`,
+        secondToken: 'tok-b-invalid',
+        logger:      { log: () => {} },
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert(!!threw, 'rejected TOKEN_B canary (401) throws');
+    assert(threw && threw.code === 'JABEARRI_CANARY_REJECTED',
+      'canary-rejection error has code JABEARRI_CANARY_REJECTED');
+
+    await new Promise(resolve => rejectingServer.close(resolve));
+  }
+
+  // Same as above, but 403 rather than 401 — the canary treats both as rejection.
+  {
+    const rejectingServer403 = http.createServer((req, res) => {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise(resolve => rejectingServer403.listen(0, '127.0.0.1', resolve));
+    const rejectingPort403 = rejectingServer403.address().port;
+
+    const freshStore403 = new SessionStore();
+    freshStore403.record({
+      method: 'GET', url: '/api/orders/1001',
+      headers: { authorization: 'Bearer tok-a' },
+      statusCode: 200, contentLength: 10, contentHash: 'json:deadbeef',
+    });
+
+    let threw = null;
+    try {
+      await runReplay({
+        store:       freshStore403,
+        targetUrl:   `http://127.0.0.1:${rejectingPort403}`,
+        secondToken: 'tok-b-invalid',
+        logger:      { log: () => {} },
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert(!!threw, 'rejected TOKEN_B canary (403) throws');
+    assert(threw && threw.code === 'JABEARRI_CANARY_REJECTED',
+      'canary-rejection (403) error has code JABEARRI_CANARY_REJECTED');
+
+    await new Promise(resolve => rejectingServer403.close(resolve));
+  }
+
   // ── CLI wrapper mode ─────────────────────────────────────────────────────
   section('cli.js — run wrapper');
 
@@ -2347,6 +2559,126 @@ async function runIntegration() {
   const wrapperReportJson = JSON.parse(fs2.readFileSync(wrapperReport, 'utf8'));
   assert(wrapperReportJson.findings.some(f => f.path === '/api/orders/777'),
     'run wrapper report contains replay finding from wrapped test traffic');
+
+  // ── CLI-level regression: distinct-credential guard reaches process exit ──
+  //
+  // The direct runReplay() unit tests above prove the guard throws with the
+  // right error code. They do not prove cli.js actually converts that into
+  // exit code 2 rather than falling through to a 0-findings report. Exercise
+  // the real child process for both abort paths.
+  {
+    const selfReplayDir    = fs2.mkdtempSync(path.join(os.tmpdir(), `jabearri-selfreplay-${process.pid}-`));
+    const selfReplayConfig = path.join(selfReplayDir, 'jabearri.config.json');
+    const selfReplayReport = path.join(selfReplayDir, 'jabearri-report.json');
+    fs2.writeFileSync(selfReplayConfig, JSON.stringify({
+      target:      `http://127.0.0.1:${wrapperTargetPort}`,
+      port:        wrapperProxyPort,
+      scope:       ['/api/'],
+      outputFile:  selfReplayReport,
+      minObserved: 1,
+    }), 'utf8');
+
+    const selfReplayRun = await new Promise(resolve => {
+      const child = spawn(process.execPath, [
+        path.join(root, 'src/cli.js'),
+        'run', '--', process.execPath, '-e', wrappedClient,
+      ], {
+        cwd: selfReplayDir,
+        env: {
+          ...process.env,
+          CI:                   'true',
+          HOME:                 selfReplayDir,
+          JABEARRI_CONFIG:      selfReplayConfig,
+          JABEARRI_TOKEN_B:     'alice-token', // identical to the recorded source token
+          JABEARRI_TEST_TARGET: `http://127.0.0.1:${wrapperTargetPort}`,
+        },
+      });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.stderr.on('data', d => { stderr += d.toString(); });
+      const timeout = setTimeout(() => { child.kill('SIGTERM'); resolve({ status: 124, stdout, stderr }); }, 10000);
+      child.on('close', code => { clearTimeout(timeout); resolve({ status: code, stdout, stderr }); });
+    });
+
+    assert(selfReplayRun.status === 2, 'CLI exits 2 when TOKEN_B matches the recorded source token');
+    assert((selfReplayRun.stdout + selfReplayRun.stderr).includes('REPLAY ABORTED'),
+      'CLI self-replay abort message reaches stderr');
+    assert(!fs2.existsSync(selfReplayReport),
+      'CLI writes no report after self-replay abort — no clean-looking result is produced');
+  }
+
+  // ── CLI-level regression: canary rejection reaches process exit ─────────
+  {
+    const canaryTarget = http.createServer((req, res) => {
+      // Canary hits HEAD / directly against the target — reject unconditionally
+      // to simulate an invalid/expired TOKEN_B, independent of app-level auth.
+      if (req.method === 'HEAD' && req.url === '/') {
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+      if (!req.headers.authorization) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      if (req.url === '/api/orders/777') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 777, owner: 'alice', total: 123 }));
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+    await new Promise(resolve => canaryTarget.listen(0, '127.0.0.1', resolve));
+    const canaryTargetPort = canaryTarget.address().port;
+
+    const canaryProbe = http.createServer();
+    await new Promise(resolve => canaryProbe.listen(0, '127.0.0.1', resolve));
+    const canaryProxyPort = canaryProbe.address().port;
+    await new Promise(resolve => canaryProbe.close(resolve));
+
+    const canaryDir    = fs2.mkdtempSync(path.join(os.tmpdir(), `jabearri-canary-${process.pid}-`));
+    const canaryConfig = path.join(canaryDir, 'jabearri.config.json');
+    const canaryReport = path.join(canaryDir, 'jabearri-report.json');
+    fs2.writeFileSync(canaryConfig, JSON.stringify({
+      target:      `http://127.0.0.1:${canaryTargetPort}`,
+      port:        canaryProxyPort,
+      scope:       ['/api/'],
+      outputFile:  canaryReport,
+      minObserved: 1,
+    }), 'utf8');
+
+    const canaryRun = await new Promise(resolve => {
+      const child = spawn(process.execPath, [
+        path.join(root, 'src/cli.js'),
+        'run', '--', process.execPath, '-e', wrappedClient,
+      ], {
+        cwd: canaryDir,
+        env: {
+          ...process.env,
+          CI:                   'true',
+          HOME:                 canaryDir,
+          JABEARRI_CONFIG:      canaryConfig,
+          JABEARRI_TOKEN_B:     'bob-token', // a plausible, distinct token — canary rejects it anyway
+          JABEARRI_TEST_TARGET: `http://127.0.0.1:${canaryTargetPort}`,
+        },
+      });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.stderr.on('data', d => { stderr += d.toString(); });
+      const timeout = setTimeout(() => { child.kill('SIGTERM'); resolve({ status: 124, stdout, stderr }); }, 10000);
+      child.on('close', code => { clearTimeout(timeout); resolve({ status: code, stdout, stderr }); });
+    });
+
+    assert(canaryRun.status === 2, 'CLI exits 2 when the TOKEN_B canary is rejected (401)');
+    assert((canaryRun.stdout + canaryRun.stderr).includes('REPLAY ABORTED'),
+      'CLI canary-rejection abort message reaches stderr');
+    assert(!fs2.existsSync(canaryReport),
+      'CLI writes no report after canary-rejection abort — no clean-looking result is produced');
+
+    await new Promise(resolve => canaryTarget.close(resolve));
+  }
 
   // A wrapped command knows JABEARRI_PROXY_URL. In run mode, child process exit
   // is the completion signal; /--flush must not let test code finalize early.

@@ -5,20 +5,20 @@ const fs = require('fs');
 // ── Why-flagged explanation ───────────────────────────────────────────────────
 
 function whyFlagged(f) {
-  const lines = ['Same endpoint replayed under a different authenticated user'];
+  const lines = ['Same endpoint replayed using the configured second credential'];
   const matchedHash = (f.evidence && f.evidence.matchedHash) || '';
   if (f.matchType === 'raw-hash-fallback') {
     lines.push('Raw response hashes matched byte-for-byte after semantic hash families differed');
-    lines.push('SHA256(raw bytes) identical for both principals');
+    lines.push('SHA256(raw bytes) identical between the recorded and replayed responses');
   } else if (f.matchType === 'size-proximity') {
     lines.push('Response sizes within 5% of each other');
     lines.push('Possible unauthorized data replay — verify manually');
   } else if (matchedHash.startsWith('raw:')) {
     lines.push('Response hashes matched using raw-byte hashing');
-    lines.push('JSON normalisation bypassed (e.g. big integers); raw-byte SHA256 identical for both principals');
+    lines.push('JSON normalisation bypassed (e.g. big integers); raw-byte SHA256 identical between the recorded and replayed responses');
   } else {
     lines.push('Response hashes matched after JSON normalisation');
-    lines.push('SHA256(normalised JSON) identical for both principals');
+    lines.push('SHA256(normalised JSON) identical between the recorded and replayed responses');
   }
   return lines;
 }

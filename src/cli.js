@@ -249,6 +249,16 @@ async function main() {
     try {
       findings = await runReplay({ store, targetUrl: target, secondToken });
     } catch (err) {
+      // JABEARRI_SELF_REPLAY / JABEARRI_CANARY_REJECTED are deliberate aborts —
+      // the run cannot honestly produce findings (self-replay would fabricate
+      // a false positive; a rejected TOKEN_B would fabricate a false clean
+      // run). Exit loudly and non-zero rather than falling through to
+      // "0 findings" below, which would look identical to a genuinely clean
+      // pass.
+      if (err.code === 'JABEARRI_SELF_REPLAY' || err.code === 'JABEARRI_CANARY_REJECTED') {
+        console.error(`\n[jabearri] REPLAY ABORTED: ${err.message}\n`);
+        process.exit(2); // exit 2 = setup/config error, same family as proxy-bypass
+      }
       console.error(`[jabearri] Replay failed: ${err.message}`);
     }
 

@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const { buildExposureSummary } = require('./exposure-summary');
 const { stripIPv6Brackets }    = require('./safety');
+const { fingerprintToken }     = require('./session-store');
 
 // Shell-safe quoting for curl reproduction commands.
 // Wraps a value in single quotes, escaping any embedded single quotes.
@@ -382,6 +383,94 @@ async function runReplay({ store, targetUrl, secondToken, logger }) {
     return findings;
   }
 
+  // ── Distinct-credential guard ───────────────────────────────────────────────
+  //
+  // jabearri's claim rests on replaying User A's recorded traffic under a
+  // different credential, User B. Nothing upstream of this point verifies
+  // that TOKEN_B differs from the credential(s) already recorded — an
+  // operator (or a misconfigured CI secret) could supply the same token twice.
+  //
+  // If that happens silently, every replay is A replaying as A: the hashes
+  // match by construction, and jabearri would report "confirmed
+  // broken-access-control" on an endpoint that was never actually tested
+  // against a second credential. That is a false positive on a correctly
+  // protected endpoint — refuse to run rather than produce it.
+  //
+  // This must compare the EFFECTIVE credential that will actually be sent on
+  // replay, not the raw JABEARRI_TOKEN_B string — those two are only the same
+  // thing for bearer/cookie/api-key auth. For 'other-auth' schemes (Basic,
+  // Digest, Token, ApiKey-as-Authorization-header), the recorded fingerprint
+  // is taken over the FULL header value including the scheme prefix (e.g.
+  // "Basic abc123"), while the documented TOKEN_B input for that scheme is
+  // just the value ("abc123") — authHeaders() reconstructs the prefix at
+  // replay time. Comparing the bare TOKEN_B string against that fingerprint
+  // would silently miss an exact self-replay for every non-bearer scheme.
+  // Recompute the same reconstruction authHeaders() uses, per recorded entry,
+  // since different entries in one run can carry different auth mechanisms.
+  //
+  // Scope of what this actually proves: this check compares effective
+  // credential *values*, not identities. It cannot detect a second valid
+  // session issued to the same underlying account (e.g. "alice-session-2")
+  // — jabearri has no way to know two different token values authenticate as
+  // the same person. Ensuring TOKEN_B belongs to a genuinely different person
+  // remains the operator's responsibility, same as scoping out public/shared
+  // endpoints.
+  //
+  // This DOES normalize trailing whitespace (trimmed before comparison) and
+  // scheme-name case, but ONLY when the operator's supplied scheme matches
+  // the recorded scheme case-insensitively (HTTP scheme names are
+  // case-insensitive per RFC 7235 §2.1, e.g. "basic" vs "Basic" is the same
+  // scheme). If the operator supplies a genuinely different scheme
+  // ("Token abc123" against a source recorded as "Basic abc123"),
+  // authHeaders() sends that scheme as supplied — the guard must compare
+  // against exactly that, not silently substitute the recorded scheme, or a
+  // legitimate distinct credential would be falsely rejected as a self-replay.
+  function effectiveReplayRaw(token, entry) {
+    const type = entry.tokenType || 'bearer';
+    const trimmed = token.trim();
+    if (type === 'other-auth') {
+      const recordedScheme = entry.originalAuthScheme || '';
+      const separatorIdx = trimmed.indexOf(' ');
+      if (separatorIdx === -1) {
+        // Bare value, no scheme supplied — authHeaders() prepends the
+        // recorded scheme, so compare against that same reconstruction.
+        return recordedScheme ? `${recordedScheme} ${trimmed}` : trimmed;
+      }
+      const suppliedScheme = trimmed.slice(0, separatorIdx);
+      const payload         = trimmed.slice(separatorIdx + 1).trim();
+      if (recordedScheme && suppliedScheme.toLowerCase() === recordedScheme.toLowerCase()) {
+        // Same scheme, possibly different case/whitespace — canonicalize to
+        // the recorded case for comparison only; authHeaders() would send
+        // the operator's own casing, but the effective credential is the same.
+        return `${recordedScheme} ${payload}`;
+      }
+      // A genuinely different scheme — authHeaders() sends it verbatim, so
+      // the comparison must use exactly what was supplied, not the recorded
+      // scheme. Still trimmed, since HTTP header whitespace is insignificant.
+      return `${suppliedScheme} ${payload}`;
+    }
+    // bearer, cookie, api-key: the raw value recorded at capture time is the
+    // same shape as the raw TOKEN_B value substituted at replay time.
+    return trimmed;
+  }
+
+  for (const entry of store.entries) {
+    const effectiveFingerprint = fingerprintToken(effectiveReplayRaw(secondToken, entry));
+    if (effectiveFingerprint === entry.tokenHash) {
+      const err = new Error(
+        'JABEARRI_TOKEN_B resolves to the same effective credential as a ' +
+        `token already recorded as a source (User A) credential (auth type: ${entry.tokenType || 'bearer'}). ` +
+        'Replay requires a credential value distinct from every recorded ' +
+        'source token — refusing to run rather than report a self-replay ' +
+        'as a confirmed authorization finding. (Note: this checks effective ' +
+        'credential value, not identity — it will not catch a second ' +
+        'session token issued to the same account.)'
+      );
+      err.code = 'JABEARRI_SELF_REPLAY';
+      throw err;
+    }
+  }
+
   // Token B liveness canary — verify the second token can authenticate
   // before running the full replay. An expired or invalid TOKEN_B causes every
   // replay to 401, producing a false clean run with zero findings.
@@ -401,15 +490,38 @@ async function runReplay({ store, targetUrl, secondToken, logger }) {
       req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
       req.end();
     });
-    // 401/403 strongly suggests TOKEN_B is invalid or expired
+    // 401/403 on HEAD / is a heuristic signal, not proof — it usually means
+    // TOKEN_B is invalid or expired, but a valid token can also get 401/403
+    // here if the root route has stricter (or just different) access rules
+    // than the API paths actually under test. This used to be a warning that
+    // let the run continue — which meant an invalid TOKEN_B could silently
+    // produce a "0 findings" run that reads as a clean bill of health when
+    // nothing was ever validly replayed. Fail closed instead: a false clean
+    // run is a worse failure mode than an occasional false setup rejection,
+    // which is loud and immediately visible rather than silent.
     if (canaryResult === 401 || canaryResult === 403) {
-      log.log('[jabearri] WARNING: TOKEN_B canary returned ' + canaryResult + ' — token may be invalid or expired.');
-      log.log('[jabearri] All replays may return ' + canaryResult + ', producing a false clean run.');
-      log.log('[jabearri] Verify JABEARRI_TOKEN_B is a valid, non-expired session token.');
-    } else {
-      log.log('[jabearri] ✓ TOKEN_B canary authenticated (status ' + canaryResult + ')');
+      const err = new Error(
+        'TOKEN_B canary got ' + canaryResult + ' on HEAD / — treating this as a ' +
+        'rejected credential and refusing to run rather than risk a false ' +
+        'clean result. This is a fail-closed safeguard, not confirmation that ' +
+        'TOKEN_B is invalid: if the token is in fact valid and the application ' +
+        'root route simply has different access rules than the API paths ' +
+        'under test, this is a false rejection — the canary currently has no ' +
+        'way to distinguish the two cases.'
+      );
+      err.code = 'JABEARRI_CANARY_REJECTED';
+      throw err;
     }
+    // Any other status (2xx, 3xx, 404, 500...) is weak, indirect evidence at
+    // best — HEAD / not being rejected is not proof the token authenticated.
+    // Many APIs have no root route at all, so a 404 here is normal and does
+    // not mean the token is bad. Say what we actually know, not more.
+    log.log('[jabearri] TOKEN_B canary: no 401/403 on HEAD / (status ' + canaryResult + ') — proceeding. This does not confirm the token is valid, only that it was not rejected outright.');
   } catch (err) {
+    // A deliberate abort (JABEARRI_CANARY_REJECTED) must not be treated the
+    // same as a network hiccup — rethrow so it reaches the caller and stops
+    // the run, instead of being logged as "proceeding anyway".
+    if (err.code === 'JABEARRI_CANARY_REJECTED') throw err;
     log.log('[jabearri] Token B canary check failed: ' + err.message + ' — proceeding anyway.');
   }
 
